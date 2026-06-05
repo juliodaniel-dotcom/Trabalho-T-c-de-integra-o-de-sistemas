@@ -1,0 +1,568 @@
+echo "# Trabalho-Tc-de-integra-o-de-sistemas" >> README.md
+git init
+git adicionar README.md
+git commit -m "primeiro commit"
+git branch -M principal
+git remoto adicionar origem https://github.com/juliodaniel-dotcom/Trabalho-T-c-de-integra-o-de-sistemas.git
+git push -u origem principal
+
+/
+├── README.md
+├── INTEGRANTES.md
+├── src/
+│   ├── main.py
+│   ├── api/
+│   │   ├── routes.py
+│   │   └── error_handlers.py
+│   ├── services/
+│   │   ├── city_service.py
+│   │   └── climate_service.py
+│   └── utils/
+│       └── validation.py
+├── tests/
+│   ├── test_health.py
+│   └── test_clima.py
+└── docs/
+    └── postman_collection.json
+
+# Integrantes da Equipe
+
+| Nome Completo | Matrícula | Papel |
+|----------------|-----------|-----------------------|
+| Julio Daniel Lopes da Silva | 2415524 | Desenvolvedor Backend |
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from api.routes import router
+
+app = FastAPI(
+    title="API de Agregação de Dados Climáticos e Geográficos",
+    version="1.0.0",
+)
+
+# CORS habilitado (para testes via navegador)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.include_router(router)
+
+# Root opcional
+@app.get("/")
+def root():
+    return {"ok": True, "message": "API N703 - use /api/v1/health"}
+
+from fastapi import APIRouter, HTTPException, Query, Path
+from typing import Optional
+
+from services.city_service import list_cities_by_uf, get_city_by_name
+from services.climate_service import get_climate_for_coordinates
+from utils.validation import validate_city_name, validate_uf
+
+from api.error_handlers import (
+    city_not_found_payload,
+    invalid_city_name_payload,
+    uf_not_found_payload,
+    invalid_uf_payload,
+    external_service_unavailable_payload,
+)
+
+router = APIRouter(prefix="/api/v1")
+
+
+@router.get("/health")
+def health():
+    # De forma simples, sempre retorna healthy.
+    # (Se quiser degradado por falha real de serviço externo, dá para implementar,
+    # mas o requisito pede principalmente que o health exista corretamente.)
+    return {
+        "status": "healthy",
+        "versao": "1.0.0",
+        "timestamp": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+
+
+@router.get("/clima/{nome_cidade}")
+def clima(
+    nome_cidade: str = Path(..., description="Nome da cidade (pode ser parcial)")
+):
+    nome_informado = nome_cidade
+
+    # 400 - nome inválido (mín. 2 caracteres)
+    invalid_payload = invalid_city_name_payload(nome_informado)
+    if not validate_city_name(nome_informado):
+        raise HTTPException(status_code=400, detail=invalid_payload)
+
+    # Busca cidade (Brasil API / IBGE) pelo nome
+    city = get_city_by_name(nome_informado)
+    if city is None:
+        raise HTTPException(status_code=404, detail=city_not_found_payload(nome_informado))
+
+    # Não usar coordenadas fixas: usamos as coordenadas retornadas pela cidade
+    try:
+        climate = get_climate_for_coordinates(
+            latitude=city["latitude"],
+            longitude=city["longitude"],
+            uf=city["uf"],
+            nome=city["nome"],
+        )
+    except ExternalServiceUnavailable:
+        raise HTTPException(status_code=503, detail=external_service_unavailable_payload("CPTEC"))
+
+    return {
+        "nome": city["nome"],
+        "estado": city["uf"],
+        "clima": climate,
+        "consultado_em": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+
+
+# Exceção declarada aqui para evitar import circular simples
+class ExternalServiceUnavailable(Exception):
+    pass
+
+
+@router.get("/cidades/{sigla_uf}")
+def cidades_por_estado(
+    sigla_uf: str = Path(..., description="Sigla do estado (2 caracteres)"),
+    limite: int = Query(10, ge=1, le=100, description="Quantidade máxima de cidades (1-100)"),
+):
+    sigla_informada = sigla_uf.upper()
+
+    # 400 - UF inválida
+    if not validate_uf(sigla_informada):
+        raise HTTPException(status_code=400, detail=invalid_uf_payload(sigla_informada))
+
+    cities = list_cities_by_uf(sigla_informada, limite=limite)
+    if cities is None:
+        raise HTTPException(status_code=404, detail=uf_not_found_payload(sigla_informada))
+
+    return {
+        "uf": sigla_informada,
+        "quantidade_retornada": len(cities),
+        "cidades": [{"nome": c} for c in cities],
+        "consultado_em": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+
+def city_not_found_payload(nome_informado: str):
+    return {
+        "erro": True,
+        "codigo": "CIDADE_NAO_ENCONTRADA",
+        "mensagem": "Nenhuma cidade encontrada com o nome informado",
+        "nome_informado": nome_informado,
+    }
+
+
+def invalid_city_name_payload(nome_informado: str):
+    return {
+        "erro": True,
+        "codigo": "NOME_INVALIDO",
+        "mensagem": "O nome da cidade deve conter pelo menos 2 caracteres",
+        "nome_informado": nome_informado,
+    }
+
+
+def uf_not_found_payload(sigla_uf_informada: str):
+    return {
+        "erro": True,
+        "codigo": "UF_NAO_ENCONTRADA",
+        "mensagem": "Estado com a sigla informada não foi encontrado",
+        "sigla_uf_informada": sigla_uf_informada,
+    }
+
+
+def invalid_uf_payload(sigla_uf_informada: str):
+    return {
+        "erro": True,
+        "codigo": "SIGLA_UF_INVALIDA",
+        "mensagem": "A sigla do estado deve conter exatamente 2 letras",
+        "sigla_uf_informada": sigla_uf_informada,
+    }
+
+
+def external_service_unavailable_payload(servico: str):
+    return {
+        "erro": True,
+        "codigo": "SERVICO_EXTERNO_INDISPONIVEL",
+        "mensagem": "Não foi possível obter dados do serviço externo. Tente novamente em alguns instantes",
+        "servico": servico,
+    }
+
+import re
+
+def validate_city_name(nome: str) -> bool:
+    if not nome:
+        return False
+    nome = nome.strip()
+    return len(nome) >= 2
+
+def validate_uf(sigla_uf: str) -> bool:
+    if not sigla_uf:
+        return False
+    return bool(re.fullmatch(r"[A-Za-z]{2}", sigla_uf))
+
+import requests
+
+BRASIL_API_BASE = "https://brasilapi.com.br"
+
+def get_city_by_name(nome_cidade: str):
+    # Estratégia:
+    # 1) consultar municípios pelo nome (Brasil API - IBGE) - endpoint pode variar
+    # Como o enunciado cita Brasil API/IBGE, faremos uma abordagem robusta:
+    # - tentar endpoint de busca por "nome" conforme docs da Brasil API
+    # - se não existir exatamente, você pode ajustar conforme a resposta real.
+    #
+    # Aqui adotamos um padrão comum:
+    # /api/ibge/municipios/v1/{nome}? or similar.
+    #
+    # Para não travar execução por variação, usamos fallback com busca em listagem.
+    #
+    # IMPORTANTE: ajuste este bloco caso a Brasil API mude a rota.
+    try_endpoints = [
+        f"{BRASIL_API_BASE}/api/ibge/municipios/v1/{nome_cidade}",
+        f"{BRASIL_API_BASE}/api/ibge/municipios/{nome_cidade}",
+    ]
+
+    last = None
+    for url in try_endpoints:
+        try:
+            r = requests.get(url, timeout=15)
+            if r.status_code == 200:
+                data = r.json()
+                # data pode ser objeto ou lista; tentamos normalizar
+                if isinstance(data, list) and data:
+                    # pega primeira melhor correspondência
+                    mun = data[0]
+                elif isinstance(data, dict):
+                    mun = data
+                else:
+                    continue
+
+                # Normalização de chaves (latitude/longitude podem vir com nomes diferentes)
+                nome = mun.get("nome") or mun.get("municipio") or mun.get("municipio_nome")
+                uf = (mun.get("microrregiao", {}) or {}).get("mesorregiao", {}).get("UF")  # raro
+                uf = uf or mun.get("UF") or mun.get("uf")
+
+                lat = mun.get("latitude") or mun.get("lat") or mun.get("Latitude")
+                lon = mun.get("longitude") or mun.get("lng") or mun.get("lon") or mun.get("Longitude")
+
+                # Muitos retornos trazem coords como "latitude" e "longitude" direto.
+                if nome and uf and lat and lon:
+                    return {
+                        "nome": str(nome),
+                        "uf": str(uf),
+                        "latitude": float(lat),
+                        "longitude": float(lon),
+                    }
+        except Exception as e:
+            last = e
+            continue
+
+    return None
+
+
+def list_cities_by_uf(sigla_uf: str, limite: int = 10):
+    # Brasil API para estados/municípios:
+    # Tentamos um endpoint comum para listar municípios por UF.
+    # Ajuste se necessário conforme docs reais da Brasil API.
+    urls = [
+        f"{BRASIL_API_BASE}/api/ibge/municipios/v1/{sigla_uf}?ordem=asc&max={limite}",
+        f"{BRASIL_API_BASE}/api/ibge/municipios/{sigla_uf}?limit={limite}",
+        f"{BRASIL_API_BASE}/api/ibge/municipios?orderBy=nome&state={sigla_uf}&limit={limite}",
+    ]
+
+    for url in urls:
+        try:
+            r = requests.get(url, timeout=15)
+            if r.status_code == 200:
+                data = r.json()
+                if isinstance(data, list):
+                    # lista pode vir como [{"nome":...}, ...] ou simples
+                    nomes = []
+                    for item in data[:limite]:
+                        if isinstance(item, dict):
+                            nome = item.get("nome") or item.get("municipio") or item.get("municipio_nome")
+                            if nome:
+                                nomes.append(str(nome))
+                        else:
+                            nomes.append(str(item))
+                    return nomes[:limite] if nomes else []
+            if r.status_code == 404:
+                return None
+        except Exception:
+            continue
+
+    return None
+
+import requests
+
+class ExternalServiceUnavailable(Exception):
+    pass
+
+BRASIL_API_BASE = "https://brasilapi.com.br"
+
+def get_climate_for_coordinates(latitude: float, longitude: float, uf: str, nome: str):
+    # Tenta CPTEC via Brasil API por nome da cidade (preferido).
+    # Endpoint pode variar conforme Brasil API docs. Abaixo estão tentativas comuns.
+    candidates = [
+        f"{BRASIL_API_BASE}/api/cptec/v1/clima/{nome}",
+        f"{BRASIL_API_BASE}/api/cptec/v1/clima?name={nome}",
+    ]
+
+    last_exc = None
+    for url in candidates:
+        try:
+            r = requests.get(url, timeout=20)
+            if r.status_code == 200:
+                data = r.json()
+
+                # Normalização dos campos.
+                # Como a estrutura pode variar, tentamos mapear campos típicos.
+                temp_min = data.get("min") or data.get("temperaturaMin") or data.get("temperatura_min")
+                temp_max = data.get("max") or data.get("temperaturaMax") or data.get("temperatura_max")
+                cond = data.get("condicao") or data.get("cond") or data.get("descricao") or data.get("weather")
+
+                # fallback: se não vier min/max, usamos um "temperatura" quando existir
+                if (temp_min is None or temp_max is None) and (data.get("temperatura") is not None):
+                    temp_min = temp_min if temp_min is not None else data.get("temperatura")
+                    temp_max = temp_max if temp_max is not None else data.get("temperatura")
+
+                # Se não conseguir condicao/descrição, tenta outro campo
+                if not cond:
+                    cond = data.get("texto") or data.get("condicaoTexto") or "Clima indisponível"
+
+                if temp_min is None or temp_max is None:
+                    # serviço respondeu, mas sem dados necessários
+                    raise ExternalServiceUnavailable()
+
+                return {
+                    "temperatura_min": int(temp_min),
+                    "temperatura_max": int(temp_max),
+                    "condicao": str(cond),
+                    "unidades": {"temperatura": "°C"},
+                }
+        except Exception as e:
+            last_exc = e
+            continue
+
+    # Se tudo falhar, retorna 503 conforme requisito
+    raise ExternalServiceUnavailable()
+
+{ "erro": true, ... }
+
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+
+from api.routes import router
+from fastapi.exceptions import RequestValidationError
+from fastapi import HTTPException
+
+app = FastAPI(
+    title="API de Agregação de Dados Climáticos e Geográficos",
+    version="1.0.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.include_router(router)
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    # Se detail já estiver no formato desejado, devolvemos direto
+    if isinstance(exc.detail, dict):
+        return JSONResponse(status_code=exc.status_code, content=exc.detail)
+    # fallback
+    return JSONResponse(status_code=exc.status_code, content={"erro": True, "mensagem": str(exc.detail)})
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    return JSONResponse(
+        status_code=400,
+        content={
+            "erro": True,
+            "codigo": "VALIDACAO_INVALIDA",
+            "mensagem": "Parâmetros inválidos",
+        },
+    )
+
+@app.get("/")
+def root():
+    return {"ok": True, "message": "API N703 - use /api/v1/health"}
+
+from fastapi.testclient import TestClient
+from src.main import app
+
+client = TestClient(app)
+
+def test_health_200():
+    resp = client.get("/api/v1/health")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "healthy"
+    assert "versao" in body
+    assert "timestamp" in body
+
+from fastapi.testclient import TestClient
+from unittest.mock import patch, Mock
+
+from src.main import app
+
+client = TestClient(app)
+
+def mock_get_city_not_found(url, timeout=15):
+    mock = Mock()
+    mock.status_code = 200
+    mock.json.return_value = []  # não encontra
+    return mock
+
+def mock_get_city_success(url, timeout=15):
+    mock = Mock()
+    mock.status_code = 200
+    mock.json.return_value = {
+        "nome": "Fortaleza",
+        "uf": "CE",
+        "latitude": -3.7319,
+        "longitude": -38.5267,
+    }
+    return mock
+
+@patch("services.city_service.requests.get", side_effect=mock_get_city_not_found)
+def test_clima_city_not_found(mocked_get):
+    resp = client.get("/api/v1/clima/FortalezaInexistente")
+    assert resp.status_code == 404
+    body = resp.json()
+    assert body["erro"] is True
+    assert body["codigo"] == "CIDADE_NAO_ENCONTRADA"
+
+@patch("services.city_service.requests.get", side_effect=mock_get_city_success)
+@patch("services.climate_service.requests.get")
+def test_clima_valid_city_success(mock_clima_get, mock_city_get):
+    # mock do CPTEC
+    mock = Mock()
+    mock.status_code = 200
+    mock.json.return_value = {
+        "min": 24,
+        "max": 32,
+        "condicao": "Parcialmente Nublado",
+    }
+    mock_clima_get.return_value = mock
+
+    resp = client.get("/api/v1/clima/Fortaleza")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["nome"].lower() == "fortaleza"
+    assert body["estado"].upper() == "CE"
+    assert "clima" in body
+    assert "temperatura_min" in body["clima"]
+    assert "temperatura_max" in body["clima"]
+    assert "condicao" in body["clima"]
+
+{
+  "info": {
+    "name": "API N703 - Agregação Dados Climáticos e Geográficos",
+    "description": "Endpoints do trabalho N703",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "Health Check",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "http://localhost:3000/api/v1/health",
+          "protocol": "http",
+          "host": ["localhost"],
+          "port": "3000",
+          "path": ["api", "v1", "health"]
+        }
+      }
+    },
+    {
+      "name": "Clima por Cidade (Fortaleza)",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "http://localhost:3000/api/v1/clima/Fortaleza",
+          "protocol": "http",
+          "host": ["localhost"],
+          "port": "3000",
+          "path": ["api", "v1", "clima", "Fortaleza"]
+        }
+      }
+    },
+    {
+      "name": "Clima por Cidade (Nome inválido)",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "http://localhost:3000/api/v1/clima/X",
+          "protocol": "http",
+          "host": ["localhost"],
+          "port": "3000",
+          "path": ["api", "v1", "clima", "X"]
+        }
+      }
+    },
+    {
+      "name": "Cidades por UF (CE, limite=5)",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "http://localhost:3000/api/v1/cidades/CE?limite=5",
+          "protocol": "http",
+          "host": ["localhost"],
+          "port": "3000",
+          "path": ["api", "v1", "cidades", "CE"],
+          "query": [
+            { "key": "limite", "value": "5" }
+          ]
+        }
+      }
+    }
+  ]
+}
+
+# API N703 - Técnicas de Integração de Sistemas
+
+## Descrição
+API REST de agregação que consulta informações geográficas e climáticas para cidades brasileiras.
+O usuário informa apenas o **nome da cidade**. A aplicação obtém coordenadas e busca dados climáticos via APIs públicas externas.
+
+## Endpoints
+
+### Health Check
+- `GET /api/v1/health`
+
+### Clima por Cidade
+- `GET /api/v1/clima/{nome_cidade}`
+
+### Listagem de Cidades por Estado
+- `GET /api/v1/cidades/{sigla_uf}?limite=10`
+
+## Como rodar
+
+### Pré-requisitos
+- Python 3.10+
+- pip
+
+### Instalação
+```bash
+pip install fastapi uvicorn requests
+pip install pytest fastapi.testclient
+
+uvicorn src.main:app --host 0.0.0.0 --port 3000 --reload
+
+pytest -q
